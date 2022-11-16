@@ -1,8 +1,12 @@
 package com.diff;
 
+import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.fge.jsonpatch.JsonPatchException;
 import com.github.fge.jsonpatch.diff.JsonDiff;
+
+import java.io.IOException;
 
 public class JsonDiffWithString {
     public static void main(String[] args) throws Exception {
@@ -54,13 +58,18 @@ public class JsonDiffWithString {
                 """;
        // String s = "{\"name\":\"isha\"}";
         //String patch = "{\"name\":\"nisha\",\"f\":\"b\"}" ;
-
-        JsonNode source = mapper.readTree(s);
-        JsonNode target = mapper.readTree(patch);
-       // final JsonPatch jsonPatch = JsonDiff.asJsonPatch(source, target);
-       //System.out.println("JSON-PATCH-Diff: " + jsonPatch + "\n");
-        final JsonNode patchNode = JsonDiff.asJson(source, target);
-        System.out.println("JSON-PATCH-Diff: " + patchNode.toPrettyString() + "\n");
+try {
+    JsonNode source = mapper.readTree(s);
+    JsonNode target = mapper.readTree(patch);
+    // final JsonPatch jsonPatch = JsonDiff.asJsonPatch(source, target);
+    //System.out.println("JSON-PATCH-Diff: " + jsonPatch + "\n");
+    final JsonNode patchNode = JsonDiff.asJson(source, target);
+    System.out.println("JSON-PATCH-Diff: " + patchNode.toPrettyString() + "\n");
+}catch (IOException e){
+    e.printStackTrace();
+}finally {
+    System.out.println("Process Successful");
+}
     }
 }
 

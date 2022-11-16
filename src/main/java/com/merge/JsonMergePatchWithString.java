@@ -14,7 +14,8 @@ public class JsonMergePatchWithString {
     "title": "Goodbye!",
     "author": {
       "givenName": "John",
-      "familyName": "Doe"
+      "familyName": "Doe",
+      "fatherName":"Kevin"
     },
     "tags": [
       "example",
@@ -48,6 +49,8 @@ public class JsonMergePatchWithString {
 
         } catch (JsonProcessingException | JsonPatchException e) {
             e.printStackTrace();
+        }finally {
+            System.out.println("Process Successful");
         }
 
     }
