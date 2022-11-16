@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.fge.jsonpatch.JsonPatchException;
-import com.github.fge.jsonpatch.diff.JsonDiff;
 import com.github.fge.jsonpatch.mergepatch.JsonMergePatch;
 
 public class JsonMergePatchWithString {
@@ -27,6 +26,7 @@ public class JsonMergePatchWithString {
         String merge = """
 {
     "title": "Hello!",
+    "message":"Have a great day",
     "author": {
       "givenName": "Neil",
       "familyName": "Nitin",
@@ -34,7 +34,8 @@ public class JsonMergePatchWithString {
     },
     "tags": [
       "Mohan",
-      "Muskesh"
+      "Mukesh",
+      "Random"
     ],
     "content": "Random comment"
 }""";
