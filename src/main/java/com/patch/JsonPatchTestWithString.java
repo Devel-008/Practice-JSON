@@ -7,7 +7,7 @@ import com.github.fge.jsonpatch.JsonPatchException;
 import java.io.IOException;
 
 public class JsonPatchTestWithString {
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         final ObjectMapper mapper = new ObjectMapper();
 
         String s = """

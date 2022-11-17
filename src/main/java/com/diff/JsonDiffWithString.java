@@ -1,15 +1,13 @@
 package com.diff;
 
-import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.fge.jsonpatch.JsonPatchException;
 import com.github.fge.jsonpatch.diff.JsonDiff;
 
 import java.io.IOException;
 
 public class JsonDiffWithString {
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         final ObjectMapper mapper = new ObjectMapper();
 
         String s = """
