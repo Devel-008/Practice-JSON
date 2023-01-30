@@ -1,0 +1,910 @@
+/*
+ * Copyright (c) 2014, Francis Galiegue (fgaliegue@gmail.com)
+ *
+ * This software is dual-licensed under:
+ *
+ * - the Lesser General Public License (LGPL) version 3.0 or, at your option, any
+ *   later version;
+ * - the Apache Software License (ASL) version 2.0.
+ *
+ * The text of this file and of both licenses is available at the root of this
+ * project or, if you have the jar distribution, in directory META-INF/, under
+ * the names LGPL-3.0.txt and ASL-2.0.txt respectively.
+ *
+ * Direct link to the sources:
+ *
+ * - LGPL 3.0: https://www.gnu.org/licenses/lgpl-3.0.txt
+ * - ASL 2.0: http://www.apache.org/licenses/LICENSE-2.0.txt
+ */
+
+package com.github.fge.jsonpatch.diff;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.github.fge.jackson.JacksonUtils;
+import com.github.fge.jackson.JsonNumEquals;
+import com.github.fge.jackson.NodeType;
+import com.github.fge.jackson.jsonpointer.JsonPointer;
+import com.github.fge.jsonpatch.JsonDiffException;
+import com.github.fge.jsonpatch.JsonPatch;
+import com.github.fge.jsonpatch.JsonPatchMessages;
+import com.github.fge.msgsimple.bundle.MessageBundle;
+import com.github.fge.msgsimple.load.MessageBundles;
+
+import javax.annotation.ParametersAreNonnullByDefault;
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.util.*;
+
+/**
+ * JSON "diff" implementation
+ *
+ * <p>This class generates a JSON Patch (as in, an RFC 6902 JSON Patch) given
+ * two JSON values as inputs. The patch can be obtained directly as a {@link
+ * JsonPatch} or as a {@link JsonNode}.</p>
+ *
+ * <p>Note: there is <b>no guarantee</b> about the usability of the generated
+ * patch for any other source/target combination than the one used to generate
+ * the patch.</p>
+ *
+ * <p>This class always performs operations in the following order: removals,
+ * additions and replacements. It then factors removal/addition pairs into
+ * move operations, or copy operations if a common element exists, at the same
+ * {@link JsonPointer pointer}, in both the source and destination.</p>
+ *
+ * <p>You can obtain a diff either as a {@link JsonPatch} directly or, for
+ * backwards compatibility, as a {@link JsonNode}.</p>
+ *
+ * @since 1.2
+ */
+@ParametersAreNonnullByDefault
+public final class JsonDiff {
+    private static final MessageBundle BUNDLE
+            = MessageBundles.getBundle(JsonPatchMessages.class);
+    private static final ObjectMapper MAPPER = JacksonUtils.newMapper();
+
+    private static final JsonNumEquals EQUIVALENCE
+            = JsonNumEquals.getInstance();
+
+    private JsonDiff() {
+    }
+
+    /**
+     * Generate a JSON patch for transforming the source node into the target
+     * node
+     *
+     * @param source the node to be patched
+     * @param target the expected result after applying the patch
+     * @return the patch as a {@link JsonPatch}
+     * @since 1.9
+     */
+    public static JsonPatch asJsonPatch(final JsonNode source,
+                                        final JsonNode target) {
+        BUNDLE.checkNotNull(source, "common.nullArgument");
+        BUNDLE.checkNotNull(target, "common.nullArgument");
+        final Map<JsonPointer, JsonNode> unchanged
+                = getUnchangedValues(source, target);
+        final DiffProcessor processor = new DiffProcessor(unchanged);
+
+        generateDiffs(processor, JsonPointer.empty(), source, target);
+        return processor.getPatch();
+    }
+
+    /**
+     * Generate a JSON patch for transforming the source node into the target
+     * node
+     *
+     * @param source the node to be patched
+     * @param target the expected result after applying the patch
+     * @return the patch as a {@link JsonNode}
+     */
+    public static JsonNode asJson(final JsonNode source, final JsonNode target) {
+        final String s;
+        try {
+            s = MAPPER.writeValueAsString(asJsonPatch(source, target));
+            return MAPPER.readTree(s);
+        } catch (IOException e) {
+            throw new RuntimeException("cannot generate JSON diff", e);
+        }
+    }
+
+    private static void generateDiffs(final DiffProcessor processor,
+                                      final JsonPointer pointer, final JsonNode source, final JsonNode target) {
+        if (EQUIVALENCE.equivalent(source, target))
+            return;
+
+        final NodeType firstType = NodeType.getNodeType(source);
+        final NodeType secondType = NodeType.getNodeType(target);
+
+        /*
+         * Node types differ: generate a replacement operation.
+         */
+        if (firstType != secondType) {
+            processor.valueReplaced(pointer, source, target);
+            return;
+        }
+
+        /*
+         * If we reach this point, it means that both nodes are the same type,
+         * but are not equivalent.
+         *
+         * If this is not a container, generate a replace operation.
+         */
+        if (!source.isContainerNode()) {
+            processor.valueReplaced(pointer, source, target);
+            return;
+        }
+
+        /*
+         * If we reach this point, both nodes are either objects or arrays;
+         * delegate.
+         */
+        if (firstType == NodeType.OBJECT)
+            generateObjectDiffs(processor, pointer, (ObjectNode) source, (ObjectNode) target);
+        else // array
+            generateArrayDiffs(processor, pointer, (ArrayNode) source, (ArrayNode) target);
+    }
+
+    private static void generateObjectDiffs(final DiffProcessor processor,final JsonPointer pointer,
+                                            final ObjectNode source,final ObjectNode target) {
+        final Set<String> firstFields
+                = collect(source.fieldNames(), new TreeSet<String>());
+        final Set<String> secondFields
+                = collect(target.fieldNames(), new TreeSet<String>());
+
+        final Set<String> copy1 = new HashSet<>(firstFields);
+        copy1.removeAll(secondFields);
+
+        for (final String field : Collections.unmodifiableSet(copy1))
+            processor.valueRemoved(pointer.append(field), source.get(field));
+
+        final Set<String> copy2 = new HashSet<>(secondFields);
+        copy2.removeAll(firstFields);
+
+
+        for (final String field : Collections.unmodifiableSet(copy2))
+            processor.valueAdded(pointer.append(field), target.get(field));
+
+        final Set<String> intersection = new HashSet<>(firstFields);
+        intersection.retainAll(secondFields);
+
+        for (final String field : intersection)
+            generateDiffs(processor, pointer.append(field), source.get(field), target.get(field));
+    }
+
+    private static <T> Set<T> collect(Iterator<T> from, Set<T> to) {
+        //it iterates
+        if (from == null) {
+            throw new NullPointerException();
+        }
+        if (to == null) {
+            throw new NullPointerException();
+        }
+        while (from.hasNext()) {
+            to.add(from.next());
+        }
+        return Collections.unmodifiableSet(to);
+    }
+
+    private static void generateArrayDiffs(final DiffProcessor processor,
+                                           final JsonPointer pointer, final ArrayNode source,
+                                           final ArrayNode target) {
+        final int firstSize = source.size();
+        final int secondSize = target.size();
+        final int size = Math.min(firstSize, secondSize);
+
+        /*
+         * Source array is larger; in this case, elements are removed from the
+         * target; the index of removal is always the original array's length.
+         */
+        for (int index = size; index < firstSize; index++)
+            processor.valueRemoved(pointer.append(size), source.get(index));
+
+        for (int index = 0; index < size; index++)
+            generateDiffs(processor, pointer.append(index), source.get(index),
+                    target.get(index));
+
+        // Deal with the destination array being larger...
+        for (int index = size; index < secondSize; index++)
+            processor.valueAdded(pointer.append("-"), target.get(index));
+    }
+
+
+    static Map<JsonPointer, JsonNode> getUnchangedValues(final JsonNode source, final JsonNode target) {
+        final Map<JsonPointer, JsonNode> ret = new HashMap<>();
+        computeUnchanged(ret, JsonPointer.empty(), source, target);
+        return ret;
+    }
+
+    private static void computeUnchanged(final Map<JsonPointer, JsonNode> ret, final JsonPointer pointer,
+                                         final JsonNode first, final JsonNode second) {
+        if (EQUIVALENCE.equivalent(first, second)) {
+            //when source and target are equal
+            ret.put(pointer, second);
+            return;
+        }
+
+        final NodeType firstType = NodeType.getNodeType(first);
+        final NodeType secondType = NodeType.getNodeType(second);
+
+        if (firstType != secondType)
+            return; // nothing in common
+
+        // We know they are both the same type, so...
+
+        switch (firstType) {
+            case OBJECT:
+                computeObject(ret, pointer, first, second);
+                break;
+            case ARRAY:
+                computeArray(ret, pointer, first, second);
+                break;
+            default:
+                /* nothing */
+        }
+    }
+
+    private static void computeObject(final Map<JsonPointer, JsonNode> ret, final JsonPointer pointer, final JsonNode source,
+                                      final JsonNode target) {
+        final Iterator<String> firstFields = source.fieldNames();
+
+        //iterate each value of source until it find the fieldName which is not present in target
+        while (firstFields.hasNext()) {
+            String name = firstFields.next();
+            if (target.has(name)) {
+                computeUnchanged(ret, pointer.append(name), source.get(name), target.get(name));
+            }
+        }
+    }
+
+    private static void computeArray(final Map<JsonPointer, JsonNode> ret,
+                                     final JsonPointer pointer, final JsonNode source, final JsonNode target) {
+        final int size = Math.min(source.size(), target.size());
+        for (int i = 0; i < size; i++)
+            computeUnchanged(ret, pointer.append(i), source.get(i), target.get(i));
+    }
+
+    public static JsonNode asJson(JsonNode source, JsonNode target, Map<JsonPointer, Set<String>> attributesKeyFields)
+            throws JsonDiffException {
+        try {
+            String s = MAPPER.writeValueAsString(asJsonPatch(source, target, attributesKeyFields));
+            return MAPPER.readTree(s);
+        } catch (IOException var5) {
+            throw new JsonDiffException(BUNDLE.getMessage("jsonDiff.generic"), var5);
+        }
+    }
+
+    public static JsonPatch asJsonPatch(JsonNode source, JsonNode target, Map<JsonPointer, Set<String>> attributesKeyFields)
+            throws JsonDiffException {
+        BUNDLE.checkNotNull(source, "common.nullArgument");
+        BUNDLE.checkNotNull(target, "common.nullArgument");
+        Map<JsonPointer, JsonNode> unchanged = getUnchangedValues(source, target);
+        DiffProcessor processor = new DiffProcessor(unchanged);
+        generateDiffs(processor, JsonPointer.empty(), source, target, attributesKeyFields);
+        return processor.getPatch();
+    }
+
+    private static void generateDiffs(DiffProcessor processor, JsonPointer pointer, JsonNode source, JsonNode target,
+                                      Map<JsonPointer, Set<String>> attributesKeyFields) throws JsonDiffException {
+        if (!EQUIVALENCE.equivalent(source, target)) {
+            NodeType firstType = NodeType.getNodeType(source);
+            NodeType secondType = NodeType.getNodeType(target);
+            if (!source.isNull() && (!source.isContainerNode() || source.size() != 0)) {
+                if (target.isNull() || (target.isContainerNode() && target.size() == 0)) {
+                    if (source.isNull() || (source.isContainerNode() && source.size() == 0)) {
+                        return;
+                    }
+                    if (source.isArray()) {
+                        for(int k = 0; k < source.size(); ++k) {
+                            processor.arrayObjectValueRemoved(pointer.append(k), source.get(k));
+                        }
+                        return;
+                    }
+                }
+                if (firstType != secondType) {
+                    processor.valueReplaced(pointer, source, target);
+                } else if (!source.isContainerNode()) {
+                    processor.valueReplaced(pointer, source, target);
+                } else {
+                    if (firstType == NodeType.OBJECT) {
+                        generateObjectDiffs(processor, pointer, (ObjectNode) source, (ObjectNode) target,
+                                attributesKeyFields);
+                    } else if (!attributesKeyFields.isEmpty()) {
+                        //enter when type of both will be array and when attributeKeyField is not empty
+                        Collection<?> primaryKeyCollection = attributesKeyFields.values();
+
+                        for (Object primaryKeyObject : primaryKeyCollection) {
+                            if (primaryKeyObject != null) {
+                                System.out.println(primaryKeyObject);
+                                System.out.println(primaryKeyObject instanceof String);
+                                if (primaryKeyObject instanceof String[]) {
+                                    generateArrayDiffs(processor, pointer, (ArrayNode) source, (ArrayNode) target, attributesKeyFields);
+                                } else {
+                                    if (!(primaryKeyObject instanceof Set)) {
+                                        throw new JsonDiffException("Primary keys value are expected to be null, "
+                                                + "String or Set of String");
+                                    }
+                                    HashMap<JsonPointer, Set<String>> primaryKeyFieldsMap = (HashMap<JsonPointer,
+                                            Set<String>>) attributesKeyFields;
+                                    generateArrayDiffs(processor, pointer, (ArrayNode) source, (ArrayNode) target, primaryKeyFieldsMap);
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        //call it when attributeKeyFields is null or empty
+                        generateArrayDiffForNullOrNoKey(processor, pointer, (ArrayNode) source, (ArrayNode) target);
+                    }
+                }
+            } else if (!target.isNull() && (!target.isContainerNode() || target.size() != 0)) {
+                if (target.isArray()) {
+                    for (JsonNode eachElementAtTarget : target) {
+                        processor.valueAdded(pointer.append("-"), eachElementAtTarget);
+                    }
+                } else {
+                    processor.valueAdded(pointer, target);
+                }
+            }
+        }
+    }
+
+    private static void generateObjectDiffs(DiffProcessor processor, JsonPointer pointer, ObjectNode source, ObjectNode
+            target, Map<JsonPointer, Set<String>> attributeKeyFields) throws JsonDiffException {
+        Set<String> firstFields = collect(source.fieldNames(), new TreeSet<String>());
+        Set<String> secondFields = collect(target.fieldNames(), new TreeSet<String>());
+        Set<String> thirdField = new HashSet<>(firstFields);
+        thirdField.removeAll(secondFields);
+        System.out.println("firstField => " + firstFields);
+        System.out.println("secondField => " + secondFields);
+        System.out.println("thirdField => " + thirdField);
+        //in this loop we will remove those firstField which are in secondField
+        boolean run =  true;
+        while (run) {
+            while (run) {
+                JsonNode fieldValue;
+                for (String field : thirdField) {
+                    fieldValue = source.get(field);
+                    if (fieldValue.size() != 0) {
+                        if (fieldValue.isArray()) {
+                            for(int index = 0; index < fieldValue.size(); ++index) {
+                                processor.arrayObjectValueRemoved(pointer.append(field).append(index), fieldValue.get(index));
+                            }
+                        } else {
+                            for (JsonNode eachField : fieldValue) {
+                                processor.valueRemoved(pointer.append(field), eachField);
+                            }
+                        }
+                    } else if (!fieldValue.isContainerNode()) {
+                        processor.valueRemoved(pointer.append(field), fieldValue);
+                    }
+                }
+                thirdField = new HashSet<>(secondFields);
+                thirdField.removeAll(firstFields);
+                //in this loop we will remove those secondField which are in firstField
+                while (run) {
+                    while (run) {
+                        for (String field : thirdField) {
+                            fieldValue = target.get(field);
+                            if (fieldValue.size() != 0) {
+                                if (fieldValue.isArray()) {
+                                    for( int index = 0; index < fieldValue.size(); ++index) {
+                                        processor.valueAdded(pointer.append(field).append(index), fieldValue.get(index));
+                                    }
+                                } else {
+                                    for (JsonNode eachField : fieldValue) {
+                                        processor.valueAdded(pointer.append(field), eachField);
+                                    }
+                                }
+                            } else if (!fieldValue.isContainerNode()) {
+                                processor.valueAdded(pointer.append(field), fieldValue);
+                            }
+                        }
+                        //it will show those value which are common in both
+                        //it will break every attribute in separate ways
+                        final Set<String> intersection = new HashSet<>(firstFields);
+                        intersection.retainAll(secondFields);
+                        for (String field : intersection) {
+                            //it will call generateDiff and again try to find any odd or mismatch
+                            generateDiffs(processor, pointer.append(field), source.get(field), target.get(field),
+                                    attributeKeyFields);
+                        }
+                        run = false;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void generateArrayDiffs(DiffProcessor processor, JsonPointer pointer, ArrayNode source, ArrayNode
+            target, Map<JsonPointer, Set<String>> attributesKeyFields) throws JsonDiffException {
+        if (source.size() == 0 && target.size() != 0) {
+            for(int k = 0; k < target.size(); ++k) {
+                processor.valueAdded(pointer.append("-"), target.get(k));
+            }
+        } else if (source.size() != 0 && target.size() == 0) {
+            for(int k = 0; k < source.size(); ++k) {
+                processor.arrayObjectValueRemoved(pointer.append(k), source.get(k));
+            }
+        } else if (!attributesKeyFields.containsKey(pointer)) {
+            //no key in attributesKeyFields
+            generateArrayDiffForNullOrNoKey(processor, pointer, source, target);
+        } else {
+            String keyFieldValue = String.valueOf(attributesKeyFields.get(pointer));
+            if (keyFieldValue == null) {
+                generateArrayDiffForNullOrNoKey(processor, pointer, source, target);
+            } else {
+                List<String> targetObjectList = new ArrayList<>(target.size());
+                List<String> objectToRemoveList = new ArrayList<>();
+                int i = 0;
+                boolean run = true;
+                while (run) {
+                    if (i >= target.size()) {
+                        for (JsonNode i1 : source) {
+                            generateObjectInArrayDiffs(processor, pointer.append(String.valueOf(i1)), source.get(String.valueOf(i1)), target,
+                                    targetObjectList, keyFieldValue, objectToRemoveList);
+                        }
+                        targetObjectList.removeAll(objectToRemoveList);
+                        for (JsonNode i1 : target) {
+                            if (targetObjectList.contains(target.get(String.valueOf(i1)).get(keyFieldValue).asText())) {
+                                processor.valueAdded(pointer.append("-"), target.get(i));
+                            }
+                        }
+                        targetObjectList.clear();
+                        run = false;
+                    }
+                    JsonNode targetObject = target.get(i);
+                    if (targetObject == null || !targetObject.has(keyFieldValue) || !targetObject.get(keyFieldValue).isTextual()) {
+                        throw new JsonDiffException(BUNDLE.getMessage("jsonDiff.PrimaryKeyMissing"));
+                    }
+                    targetObjectList.add(targetObject.get(keyFieldValue).asText());
+                    ++i;
+                }
+            }
+        }
+    }
+
+    private static void generateArrayDiffForNullOrNoKey(DiffProcessor processor, JsonPointer pointer, ArrayNode source, ArrayNode target) {
+        List<JsonNode> toAddList = new ArrayList<>();
+        List<JsonNode> toRemoveList = new ArrayList<>();
+        for (JsonNode eachAdd : target) {
+                //first iterate target then and add those values to toAddList
+                toAddList.add(eachAdd);
+        }
+        for (JsonNode eachAdd : source) {
+            if (toAddList.contains(eachAdd)) {
+                //then iterate source then check the values if they already exist then remove them source
+                toAddList.remove(eachAdd);
+            } else {
+                //else add those value in toRemoveList source
+                toRemoveList.add(eachAdd);
+            }
+        }
+        for (int k = 0; k < source.size(); ++k) {
+            if (toRemoveList.contains(source.get(k))) {
+                //remove those values which are present in toRemoveList
+                processor.arrayObjectValueRemoved(pointer.append(k), source.get(k));
+            }
+        }
+        for (JsonNode eachAdd : toAddList) {
+            //add again values after removal
+            processor.valueAdded(pointer.append("-"), eachAdd);
+        }
+    }
+
+    private static void generateObjectInArrayDiffs(DiffProcessor processor, JsonPointer pointer, JsonNode source, JsonNode target, List<String> targetObjectList, String keyFieldValue, List<String> objectToRemoveList) throws JsonDiffException {
+        JsonNode sourceObject = source.get(keyFieldValue);
+        if (source.get(keyFieldValue) != null && !source.get(keyFieldValue).isContainerNode()) {
+            if (targetObjectList.contains(sourceObject.asText())) {
+                objectToRemoveList.add(sourceObject.asText());
+                for(int i = 0; i < target.size(); ++i) {
+                    if (target.get(i).get(keyFieldValue).equals(sourceObject) && !target.get(i).equals(source)) {
+                        generateCustomDiffs(processor, pointer, source, target.get(i));
+                    }
+                }
+            } else {
+                processor.arrayObjectValueRemoved(pointer, source);
+            }
+        } else {
+            throw new JsonDiffException(BUNDLE.getMessage("jsonDiff.PrimaryKeyMissing"));
+        }
+    }
+
+    private static void generateCustomDiffs(DiffProcessor processor, JsonPointer pointer, JsonNode source, JsonNode target) {
+        Set<String> sourceFields = collect(source.fieldNames(), new TreeSet<String>());
+        Set<String> targetFields = collect(target.fieldNames(), new TreeSet<String>());
+        for (String field : sourceFields) {
+            //here it will only enter when the field of source is not present in target field
+            if (!source.get(field).equals(target.get(field))) {
+                processor.arrayObjectValueReplaced(pointer.append(field), source, target.get(field));
+            }
+        }
+        Set<String> thirdField = new HashSet<>(targetFields);
+        thirdField.removeAll(sourceFields);
+        for (String field : thirdField) {
+            processor.arrayObjectValueReplaced(pointer.append(field), source, target.get(field));
+        }
+    }
+
+    private static void generateArrayDiffs(DiffProcessor differenceProcessor, JsonPointer pathPointer, ArrayNode oldJson, ArrayNode newJson, HashMap<JsonPointer, Set<String>> primaryKeyMap) throws JsonDiffException {
+        Set<String> primaryKeys = pathValueResolver(primaryKeyMap, pathPointer);
+        //it will resolve path for the primary key
+        if (primaryKeys != null && !primaryKeys.isEmpty()) {
+            Map<Map<String, JsonNode>, Integer> oldIndexKeyValueMap = generateMapOfKeysValues(oldJson, primaryKeys);
+            Map<Map<String, JsonNode>, Integer> newIndexKeyValueMap = generateMapOfKeysValues(newJson, primaryKeys);
+            Set<Map<String, JsonNode>> oldKeyValueSet = oldIndexKeyValueMap.keySet();
+            Set<Map<String, JsonNode>> newKeyValueSet = newIndexKeyValueMap.keySet();
+            Set<Map<String, JsonNode>> difference = new HashSet<>(oldKeyValueSet);
+            difference.removeAll(newKeyValueSet);
+            //difference will store value of oldKeyValueSet which are not present in newKeyValueSet
+            Integer oldIndex;
+            for (Map<String, JsonNode> replaceObject : difference) {
+                oldIndex = oldIndexKeyValueMap.get(replaceObject);
+                //it will first remove from source
+                differenceProcessor.arrayObjectValueRemoved(pathPointer.append(oldIndex), oldJson.get(oldIndex));
+            }
+            difference = new HashSet<>(newKeyValueSet);
+            difference.removeAll(oldKeyValueSet);
+            //difference will store value of newKeyValueSet which are not present in oldKeyValueSet
+            for (Map<String, JsonNode> replaceObject : difference) {
+                oldIndex = newIndexKeyValueMap.get(replaceObject);
+                //then it will add the new value in source
+                differenceProcessor.valueAdded(pathPointer.append("-"), newJson.get(oldIndex));
+            }
+            final Set<Map<String, JsonNode>> intersection = new HashSet<>(oldKeyValueSet);
+            intersection.retainAll(newKeyValueSet);
+            //intersection will store common values of both
+            //replaceObject will store
+            for (Map<String, JsonNode> replaceObject : intersection) {
+                oldIndex = oldIndexKeyValueMap.get(replaceObject);
+                int newIndex = newIndexKeyValueMap.get(replaceObject);
+                generateCustomDiffs(differenceProcessor, pathPointer.append(oldIndex), oldJson.get(oldIndex), newJson.get(newIndex));
+            }
+        } else {
+            generateArrayDiffForNullOrNoKey(differenceProcessor, pathPointer, oldJson, newJson);
+        }
+    }
+
+    private static Set<String> pathValueResolver(Map<JsonPointer, Set<String>> primaryKeyMap, JsonPointer path) {
+        Set<String> primaryKeys = null;
+        if (primaryKeyMap != null) {
+            primaryKeys = primaryKeyMap.get(path);
+        }
+        return primaryKeys;
+    }
+
+    private static Map<Map<String, JsonNode>, Integer> generateMapOfKeysValues(ArrayNode json, Set<String> primaryKeys) throws JsonDiffException {
+        Map<Map<String, JsonNode>, Integer> indexKeyValueMap = new HashMap<>();
+        for (int i = 0; i < json.size(); ++i) {
+            JsonNode valueNode = json.get(i);
+            Map<String, JsonNode> keyValueMap = new HashMap<>();
+
+            for (String primaryKey : primaryKeys) {
+                JsonNode val = valueNode.get(primaryKey);
+                if (val == null) {
+                    throw new JsonDiffException(BUNDLE.getMessage("jsonDiff.PrimaryKeyMissing"));
+                }
+                keyValueMap.put(primaryKey, val);
+            }
+            indexKeyValueMap.put(keyValueMap, i);
+        }
+        return indexKeyValueMap;
+    }
+}
+//diffProcessor
+
+/*
+ * Copyright (c) 2014, Francis Galiegue (fgaliegue@gmail.com)
+ *
+ * This software is dual-licensed under:
+ *
+ * - the Lesser General Public License (LGPL) version 3.0 or, at your option, any
+ *   later version;
+ * - the Apache Software License (ASL) version 2.0.
+ *
+ * The text of this file and of both licenses is available at the root of this
+ * project or, if you have the jar distribution, in directory META-INF/, under
+ * the names LGPL-3.0.txt and ASL-2.0.txt respectively.
+ *
+ * Direct link to the sources:
+ *
+ * - LGPL 3.0: https://www.gnu.org/licenses/lgpl-3.0.txt
+ * - ASL 2.0: http://www.apache.org/licenses/LICENSE-2.0.txt
+ */
+
+package com.github.fge.jsonpatch.diff;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.github.fge.jackson.JsonNumEquals;
+import com.github.fge.jackson.jsonpointer.JsonPointer;
+import com.github.fge.jsonpatch.JsonPatch;
+import com.github.fge.jsonpatch.JsonPatchOperation;
+
+import javax.annotation.Nullable;
+import java.util.*;
+
+// TODO: cleanup
+final class DiffProcessor {
+    private static final JsonNumEquals EQUIVALENCE
+            = JsonNumEquals.getInstance();
+
+    private final Map<JsonPointer, JsonNode> unchanged;
+
+    private final List<DiffOperation> diffs = new ArrayList<>();
+
+    DiffProcessor(final Map<JsonPointer, JsonNode> unchanged) {
+        this.unchanged = Collections.unmodifiableMap(new HashMap<>(unchanged));
+    }
+
+    void valueReplaced(final JsonPointer pointer, final JsonNode oldValue,
+                       final JsonNode newValue) {
+        diffs.add(DiffOperation.replace(pointer, oldValue, newValue));
+    }
+
+    void valueRemoved(final JsonPointer pointer, final JsonNode value) {
+        diffs.add(DiffOperation.remove(pointer, value));
+    }
+
+    void valueAdded(final JsonPointer pointer, final JsonNode value) {
+        final int removalIndex = findPreviouslyRemoved(value);
+        if (removalIndex != -1) {
+            DiffOperation removed = diffs.get(removalIndex);
+            diffs.remove(removalIndex);
+            diffs.add(DiffOperation.move(removed.getFrom(), value, pointer, value));
+            return;
+        }
+        final JsonPointer ptr = findUnchangedValue(value);
+        final DiffOperation op = (ptr != null) ? DiffOperation.copy(ptr, pointer, value) : DiffOperation.add(pointer, value);
+        diffs.add(op);
+    }
+
+    JsonPatch getPatch() {
+        List<JsonPatchOperation> list = new ArrayList<>();
+
+        for (DiffOperation op : this.diffs) {
+            list.add(op.asJsonPatchOperation());
+        }
+
+        return new JsonPatch(list);
+    }
+
+    @Nullable
+    private JsonPointer findUnchangedValue(final JsonNode value) {
+
+        for (final Map.Entry<JsonPointer, JsonNode> entry : unchanged.entrySet())
+            if (EQUIVALENCE.equivalent(value, entry.getValue()))
+                return entry.getKey();
+        return null;
+
+    }
+
+    private int findPreviouslyRemoved(final JsonNode value) {
+        DiffOperation op;
+
+        for (int i = 0; i < diffs.size(); i++) {
+            op = diffs.get(i);
+            if (op.getType() == DiffOperation.Type.REMOVE
+                    && EQUIVALENCE.equivalent(value, op.getOldValue()))
+                return i;
+        }
+        return -1;
+    }
+
+    void arrayObjectValueReplaced(JsonPointer pointer, JsonNode oldValue, JsonNode newValue) {
+        this.diffs.add(DiffOperation.arrayObjectReplace(pointer, oldValue, newValue));
+    }
+
+    void arrayObjectValueRemoved(JsonPointer pointer, JsonNode value) {
+        this.diffs.add(DiffOperation.arrayObjectRemove(pointer, value));
+    }
+}
+
+//diffOperation
+
+/*
+ * Copyright (c) 2014, Francis Galiegue (fgaliegue@gmail.com)
+ *
+ * This software is dual-licensed under:
+ *
+ * - the Lesser General Public License (LGPL) version 3.0 or, at your option, any
+ *   later version;
+ * - the Apache Software License (ASL) version 2.0.
+ *
+ * The text of this file and of both licenses is available at the root of this
+ * project or, if you have the jar distribution, in directory META-INF/, under
+ * the names LGPL-3.0.txt and ASL-2.0.txt respectively.
+ *
+ * Direct link to the sources:
+ *
+ * - LGPL 3.0: https://www.gnu.org/licenses/lgpl-3.0.txt
+ * - ASL 2.0: http://www.apache.org/licenses/LICENSE-2.0.txt
+ */
+
+package com.github.fge.jsonpatch.diff;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.github.fge.jackson.jsonpointer.JsonPointer;
+import com.github.fge.jsonpatch.*;
+
+final class DiffOperation {
+    private final Type type;
+    /* An op's "from", if any */
+    private final JsonPointer from;
+    /* Value displaced by this operation, if any */
+    private final JsonNode oldValue;
+    /* An op's "path", if any */
+    private final JsonPointer path;
+    /* An op's "value", if any */
+    private final JsonNode value;
+
+    static DiffOperation add(final JsonPointer path,
+                             final JsonNode value) {
+        return new DiffOperation(Type.ADD, null, null, path, value);
+    }
+
+    static DiffOperation copy(final JsonPointer from,
+                              final JsonPointer path, final JsonNode value) {
+        return new DiffOperation(Type.COPY, from, null, path,
+                value);
+    }
+
+    static DiffOperation move(final JsonPointer from,
+                              final JsonNode oldValue, final JsonPointer path,
+                              final JsonNode value) {
+        return new DiffOperation(Type.MOVE, from, oldValue, path,
+                value);
+    }
+
+    static DiffOperation remove(final JsonPointer from,
+                                final JsonNode oldValue) {
+        return new DiffOperation(Type.REMOVE, from, oldValue, null, null);
+    }
+
+    static DiffOperation replace(final JsonPointer from,
+                                 final JsonNode oldValue, final JsonNode value) {
+        return new DiffOperation(Type.REPLACE, from, oldValue, null,
+                value);
+    }
+
+    static DiffOperation arrayObjectRemove(JsonPointer from, JsonNode oldValue) {
+        return new DiffOperation(DiffOperation.Type.REMOVEARRAYOBJECT, from, oldValue, null, null);
+    }
+
+    static DiffOperation arrayObjectReplace(JsonPointer from, JsonNode oldValue, JsonNode value) {
+        return new DiffOperation(DiffOperation.Type.REPLACEARRAYOBJECT, from, oldValue, null, value);
+    }
+
+    private DiffOperation(final Type type, final JsonPointer from,
+                          final JsonNode oldValue, final JsonPointer path,
+                          final JsonNode value) {
+        this.type = type;
+        this.from = from;
+        this.oldValue = oldValue;
+        this.path = path;
+        this.value = value;
+    }
+
+    DiffOperation.Type getType() {
+        return type;
+    }
+
+    JsonPointer getFrom() {
+        return from;
+    }
+
+    JsonNode getOldValue() {
+        return oldValue;
+    }
+
+    JsonPointer getPath() {
+        return path;
+    }
+
+    JsonNode getValue() {
+        return value;
+    }
+
+    JsonPatchOperation asJsonPatchOperation() {
+        return type.toOperation(this);
+    }
+
+    enum Type {
+        ADD {
+            @Override
+            JsonPatchOperation toOperation(final DiffOperation op) {
+                return new AddOperation(op.path, op.value);
+            }
+        },
+        COPY {
+            @Override
+            JsonPatchOperation toOperation(final DiffOperation op) {
+                return new CopyOperation(op.from, op.path);
+            }
+        },
+        MOVE {
+            @Override
+            JsonPatchOperation toOperation(final DiffOperation op) {
+                return new MoveOperation(op.from, op.path);
+            }
+        },
+        REMOVE {
+            @Override
+            JsonPatchOperation toOperation(final DiffOperation op) {
+                return new RemoveOperation(op.from);
+            }
+        },
+        REPLACE {
+            @Override
+            JsonPatchOperation toOperation(final DiffOperation op) {
+                return new ReplaceOperation(op.from, op.value);
+            }
+        },
+        REMOVEARRAYOBJECT {
+            @Override
+            JsonPatchOperation toOperation(DiffOperation op) {
+                return new ArrayObjectRemoveOperation(op.from, op.oldValue);
+            }
+        },
+        REPLACEARRAYOBJECT {
+            @Override
+            JsonPatchOperation toOperation(DiffOperation op) {
+                return new ArrayObjectReplaceOperation(op.from, op.oldValue, op.value);
+            }
+        };
+
+        Type() {
+        }
+
+        abstract JsonPatchOperation toOperation(final DiffOperation op);
+    }
+}
+//PathOldNewValue
+
+//
+// Source code recreated from a .class file by IntelliJ IDEA
+// (powered by FernFlower decompiler)
+//
+
+package com.github.fge.jsonpatch;
+
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+import com.github.fge.jackson.jsonpointer.JsonPointer;
+import java.io.IOException;
+
+public abstract class PathOldNewValueOperation extends JsonPatchOperation {
+    @JsonSerialize
+    protected final JsonNode oldValue;
+    @JsonSerialize
+    protected final JsonNode newValue;
+
+    protected PathOldNewValueOperation(String op, JsonPointer path, JsonNode oldValue, JsonNode newValue) {
+        super(op, path);
+        this.oldValue = oldValue;
+        this.newValue = newValue;
+    }
+    @Override
+    public final void serialize(JsonGenerator jgen, SerializerProvider provider) throws IOException {
+        jgen.writeStartObject();
+        jgen.writeStringField("op", op);
+        jgen.writeStringField("path", path.toString());
+        jgen.writeFieldName("value");
+        jgen.writeTree(this.newValue);
+        jgen.writeFieldName("original_value");
+        jgen.writeTree(this.oldValue);
+        jgen.writeEndObject();
+    }
+    @Override
+    public final void serializeWithType(JsonGenerator jgen, SerializerProvider provider, TypeSerializer typeSer) throws IOException {
+        this.serialize(jgen, provider);
+    }
+    @Override
+    public final String toString() {
+        return "op: " + this.op + "; " + "path" + ": \"" + this.path + "\"; " + "value" + " : " + this.newValue + "; " + "original_value" + ": \"" + this.oldValue;
+    }
+}
+

@@ -19,7 +19,6 @@ public class JsonDiffWithMap {
 
         Map<String , String> diff = new HashMap<>();
         diff.put("1","Amit");
-        diff.put("3","Rahul");
         diff.put("5","Rohit");
         diff.put("7","Amit");
         diff.put("9","Sunil");
@@ -29,7 +28,7 @@ public class JsonDiffWithMap {
         JsonNode target = mapper.valueToTree(diff);
         // final JsonPatch jsonPatch = JsonDiff.asJsonPatch(source, target);
         //System.out.println("JSON-PATCH-Diff: " + jsonPatch + "\n");
-        final JsonNode patchNode = JsonDiff.asJson(source, target);
-        System.out.println("JSON-PATCH-Diff: " + patchNode.toPrettyString() + "\n");
+        final JsonNode diffNode = JsonDiff.asJson(source, target);
+        System.out.println("JSON-PATCH-Diff: " + diffNode.toPrettyString() + "\n");
     }
 }

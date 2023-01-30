@@ -25,17 +25,21 @@ public class JsonPatchTestWithString {
 }""";
 
        String patch = """
-    [
-        { "op": "replace", "path": "/title", "value": "Hello!"},
-        { "op": "remove", "path": "/author/familyName"},
-        { "op": "add", "path": "/phoneNumber", "value": "+01-123-456-7890"},
-        { "op": "replace", "path": "/tags", "value": ["example","hello"]}
-    ]
-""";
+                   [
+                       { "op": "replace", "path": "/title", "value":  {
+                                                                                                "roleName": "newrole",
+                                                                                                "orgBidNos": "neworg",
+                                                                                                "updateTime": 678
+                                                                                              }},
+                       { "op": "remove", "path": "/tags"},
+                       { "op": "add", "path": "/phoneNumber", "value": "+01-123-456-7890"}
+                   
+                     
+                   ]
+               """;
        try {
            JsonPatch jsonPatch = JsonPatch.fromJson(mapper.readTree(patch));
-           String target = String.valueOf(jsonPatch.apply(mapper.readTree(s)));
-           System.out.println(s);
+           String target = String.valueOf(jsonPatch.apply(mapper.readTree(s)).toPrettyString());
            System.out.println(target);
 
        }catch (JsonPatchException | IOException e){

@@ -1,0 +1,599 @@
+/*
+ * Copyright (c) 2014, Francis Galiegue (fgaliegue@gmail.com)
+ *
+ * This software is dual-licensed under:
+ *
+ * - the Lesser General Public License (LGPL) version 3.0 or, at your option, any
+ *   later version;
+ * - the Apache Software License (ASL) version 2.0.
+ *
+ * The text of this file and of both licenses is available at the root of this
+ * project or, if you have the jar distribution, in directory META-INF/, under
+ * the names LGPL-3.0.txt and ASL-2.0.txt respectively.
+ *
+ * Direct link to the sources:
+ *
+ * - LGPL 3.0: https://www.gnu.org/licenses/lgpl-3.0.txt
+ * - ASL 2.0: http://www.apache.org/licenses/LICENSE-2.0.txt
+ */
+
+package com.github.fge.jsonpatch;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.JsonSerializable;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+import com.github.fge.jackson.JacksonUtils;
+import com.github.fge.jackson.jsonpointer.JsonPointer;
+import com.github.fge.msgsimple.bundle.MessageBundle;
+import com.github.fge.msgsimple.load.MessageBundles;
+
+import java.io.IOException;
+import java.util.*;
+
+
+/**
+ * Implementation of JSON Patch
+ *
+ * <p><a href="https://tools.ietf.org/html/rfc6902">JSON
+ * Patch</a>, as its name implies, is an IETF RFC describing a mechanism to
+ * apply a patch to any JSON value. This implementation covers all operations
+ * according to the specification; however, there are some subtle differences
+ * with regards to some operations which are covered in these operations'
+ * respective documentation.</p>
+ *
+ * <p>An example of a JSON Patch is as follows:</p>
+ *
+ * <pre>
+ *     [
+ *         {
+ *             "op": "add",
+ *             "path": "/-",
+ *             "value": {
+ *                 "productId": 19,
+ *                 "name": "Duvel",
+ *                 "type": "beer"
+ *             }
+ *         }
+ *     ]
+ * </pre>
+ *
+ * <p>This patch contains a single operation which adds an item at the end of
+ * an array. A JSON Patch can contain more than one operation; in this case, all
+ * operations are applied to the input JSON value in their order of appearance,
+ * until all operations are applied or an error condition is encountered.</p>
+ *
+ * <p>The main point where this implementation differs from the specification
+ * is initial JSON parsing. The draft says:</p>
+ *
+ * <pre>
+ *     Operation objects MUST have exactly one "op" member
+ * </pre>
+ *
+ * <p>and:</p>
+ *
+ * <pre>
+ *     Additionally, operation objects MUST have exactly one "path" member.
+ * </pre>
+ *
+ * <p>However, obeying these to the letter forces constraints on the JSON
+ * <b>parser</b>. Here, these constraints are not enforced, which means:</p>
+ *
+ * <pre>
+ *     [ { "op": "add", "op": "remove", "path": "/x" } ]
+ * </pre>
+ *
+ * <p>is parsed (as a {@code remove} operation, since it appears last).</p>
+ *
+ * <p><b>IMPORTANT NOTE:</b> the JSON Patch is supposed to be VALID when the
+ * constructor for this class ({@link JsonPatch#fromJson(JsonNode)} is used.</p>
+ */
+public final class JsonPatch implements JsonSerializable, Patch {
+    private static final MessageBundle BUNDLE = MessageBundles.getBundle(JsonPatchMessages.class);
+    /**
+     * List of operations
+     */
+    private final List<JsonPatchOperation> operations;
+
+    /**
+     * Constructor
+     *
+     * <p>Normally, you should never have to use it.</p>
+     *
+     * @param operations the list of operations for this patch
+     * @see JsonPatchOperation
+     */
+    @JsonCreator
+    public JsonPatch(final List<JsonPatchOperation> operations) {
+        this.operations = Collections.unmodifiableList(new ArrayList<>(operations));
+    }
+
+    /**
+     * Static factory method to build a JSON Patch out of a JSON representation
+     *
+     * @param node the JSON representation of the generated JSON Patch
+     * @return a JSON Patch
+     * @throws IOException          input is not a valid JSON patch
+     * @throws NullPointerException input is null
+     */
+    public static JsonPatch fromJson(final JsonNode node)
+            throws IOException {
+        BUNDLE.checkNotNull(node, "jsonPatch.nullInput");
+        return JacksonUtils.getReader().forType(JsonPatch.class).readValue(node);
+    }
+
+    /**
+     * Apply this patch to a JSON value
+     *
+     * @param node the value to apply the patch to
+     * @return the patched JSON value
+     * @throws JsonPatchException   failed to apply patch
+     * @throws NullPointerException input is null
+     */
+    @Override
+    public JsonNode apply(final JsonNode node)
+            throws JsonPatchException {
+        BUNDLE.checkNotNull(node, "jsonPatch.nullInput");
+        JsonNode ret = node;
+        for (final JsonPatchOperation operation : operations)
+            ret = operation.apply(ret);
+        return ret;
+    }
+
+    public List<JsonPatchOperation> getOperations() {
+        return operations;
+    }
+
+    public JsonNode apply(JsonNode node, boolean performStrictValidation) throws JsonPatchException {
+        BUNDLE.checkNotNull(node, "jsonPatch.nullInput");
+        List<JsonPatchOperation> finalJsonPatchOperations = new ArrayList<>(this.operations.size());
+        List<JsonPatchOperation> updateJsonPatch = new ArrayList<>();
+        List<JsonPatchOperation> addJsonPatch = new ArrayList<>();
+        List<JsonPatchOperation> patchesToRemove = new ArrayList<>();
+        Map<String, TreeMap<Integer, JsonPatchOperation>> mapOfMultivaluedAttributesPatches = new HashMap<>();
+        for (final JsonPatchOperation operation : operations) {
+            //System.out.println("operation.getPath().parent().toString():= " + operation.getPath().parent().toString());
+            //this loop will iterate operations and find out which operation
+            if (operation.getOp().equals("add")) {
+                //for add operation this will work
+                addJsonPatch.add(operation);
+            } else if (operation.getOp().equals("replace")) {
+                updateJsonPatch.add(operation);
+            } else if (!operation.getPath().parent().isEmpty()) {
+                //for remove operation
+                String lastIndex = Iterables.getLast(operation.getPath()).getToken().getRaw();
+                try {
+                    Integer lastIndexIsInt = Integer.parseInt(lastIndex);
+                    TreeMap<Integer, JsonPatchOperation> multiValuedAttributePatches = mapOfMultivaluedAttributesPatches.get(operation.getPath().parent().toString());
+                    if (multiValuedAttributePatches == null) {
+                        multiValuedAttributePatches = new TreeMap<>(Collections.reverseOrder());
+                        mapOfMultivaluedAttributesPatches.put(operation.getPath().parent().toString(), multiValuedAttributePatches);
+                    }
+                    multiValuedAttributePatches.put(lastIndexIsInt, operation);
+                } catch (NumberFormatException var14) {
+                    patchesToRemove.add(operation);
+                }
+            } else {
+                patchesToRemove.add(operation);
+            }
+        }
+      //  Map.Entry<String, TreeMap<Integer, JsonPatchOperation>> multiValuedAttributePatches  = (Map.Entry<String, TreeMap<Integer, JsonPatchOperation>>) mapOfMultivaluedAttributesPatches.entrySet();
+
+        for(Map.Entry<String, TreeMap<Integer, JsonPatchOperation>>multiValuedAttributePatches : mapOfMultivaluedAttributesPatches.entrySet() ) {
+            patchesToRemove.addAll(multiValuedAttributePatches.getValue().values());
+        }
+        finalJsonPatchOperations.addAll(updateJsonPatch);
+        finalJsonPatchOperations.addAll(patchesToRemove);
+        finalJsonPatchOperations.addAll(addJsonPatch);
+        JsonNode ret = node.deepCopy();
+        JsonNode valueLocator;
+        for (JsonPatchOperation operation : finalJsonPatchOperations) {
+            JsonPointer path = operation.getPath();
+            //store the path and valueLocator in operation
+            valueLocator = operation.getValue_locator();
+            //System.out.println("(valueLocator):="+valueLocator);
+            if (path != null && valueLocator != null && valueLocator.isObject()) {
+
+                JsonPointer newPath = this.pathFixer(path, ret, valueLocator, performStrictValidation);
+                if (newPath == null) {
+                    operation.path = null;
+                } else {
+                    operation.path = newPath;
+                    operation.value_locator = null;
+                }
+            }
+            if (operation.path != null) {
+                ret = operation.apply(ret);
+            }
+            operation.path = path;
+            operation.value_locator = valueLocator;
+            //System.out.println("(valueLocator):="+valueLocator);
+        }
+        return ret;
+    }
+
+    private JsonPointer pathFixer(JsonPointer path, JsonNode node, JsonNode valueLocator, boolean performStrictValidation) throws JsonPatchException {
+        JsonPointer newPath = path.parent();
+        boolean located = false;
+        boolean unknownLastSecondPartOfPath = false;
+        if (newPath.get(node) == null) {
+            if (newPath.parent().get(node) == null) {
+                throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.ArrayNodeMissingValue"));
+            }
+            //it will break the path to find it
+            newPath = newPath.parent();
+            //  System.out.println(newPath);
+            unknownLastSecondPartOfPath = true;
+        }
+        JsonNode presentNode = newPath.get(node);
+        //  System.out.println(presentNode);
+        Iterator<String> valueLocatorFields = valueLocator.fieldNames();
+        if (!presentNode.isArray()) {
+            throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.ArrayNodeMissingValue"));
+        } else {
+            // when node is array
+            Map<String, JsonNode> valueLocatorMap = new HashMap<>();
+            for (Iterator<String> it = valueLocatorFields; it.hasNext(); ) {
+                //iterate for valueLocator
+                String eachFieldName = it.next();
+                //System.out.println(eachFieldName);
+                valueLocatorMap.put(eachFieldName, valueLocator.get(eachFieldName));
+                // System.out.println(valueLocatorMap);
+                //valueLocator value and ValueLocator's FieldName is stored
+            }
+            Map<String, JsonNode> eachNodeMap = new HashMap<>();
+            for (int index = 0; index < presentNode.size(); ++index) {
+                JsonNode eachParentNode = presentNode.get(index);
+                //System.out.println(eachNodeMap);
+                //will store the valueLocator attribute on which operation has to be done
+                Iterator<String> var14 = valueLocator.fieldNames();
+                while (var14.hasNext()) {
+                    String eachFieldName = var14.next();
+                    // System.out.println(eachFieldName);
+                    eachNodeMap.put(eachFieldName, eachParentNode.get(eachFieldName));
+                    //System.out.println(eachNodeMap);
+                    //iterate and find the valueLocator where operation have to be performed
+                }
+                if (eachNodeMap.equals(valueLocatorMap)) {
+                    //eachNode and valueLocatorMap  equal
+                    located = true;
+                    newPath = newPath.append(index);
+                    //then will append index of that in newPath
+                    if (unknownLastSecondPartOfPath) {
+                        String lastOfPath = Iterables.getLast(path).getToken().getRaw();
+                        newPath = newPath.append(lastOfPath);
+                        //then it will append lastOfPath with newPath
+                    }
+                }
+            }
+            if (!located) {
+                if (performStrictValidation) {
+                    throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.noSuchPath"));
+                } else {
+                    return null;
+                }
+            } else {
+                return newPath;
+            }
+        }
+    }
+
+    @Override
+    public String toString() {
+        return operations.toString();
+    }
+
+    @Override
+    public void serialize(final JsonGenerator jgen, final SerializerProvider provider) throws IOException {
+        jgen.writeStartArray();
+        for (final JsonPatchOperation op : operations)
+            op.serialize(jgen, provider);
+        jgen.writeEndArray();
+    }
+
+    @Override
+    public void serializeWithType(final JsonGenerator jgen, final SerializerProvider provider, final TypeSerializer typeSer) throws IOException {
+        serialize(jgen, provider);
+    }
+}
+
+
+// arrayObjectRemove
+package com.github.fge.jsonpatch;
+
+//
+// Source code recreated from a .class file by IntelliJ IDEA
+// (powered by FernFlower decompiler)
+//
+
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.MissingNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.github.fge.jackson.jsonpointer.JsonPointer;
+import java.io.IOException;
+
+public final class ArrayObjectRemoveOperation extends PathValueOperation {
+    @JsonCreator
+    public ArrayObjectRemoveOperation(@JsonProperty("path") JsonPointer path, @JsonProperty("value") JsonNode value) {
+        super("remove", path, value);
+    }
+@Override
+    public JsonNode apply(JsonNode node) throws JsonPatchException {
+        if (this.path.isEmpty()) {
+            return MissingNode.getInstance();
+        } else if (this.path.path(node).isMissingNode()) {
+            throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.noSuchPath"));
+        } else {
+            JsonNode ret = node.deepCopy();
+            JsonNode parentNode = this.path.parent().get(ret);
+            String raw = Iterables.getLast(this.path).getToken().getRaw();
+            if (parentNode.isObject()) {
+                ((ObjectNode)parentNode).remove(raw);
+            } else {
+                ((ArrayNode)parentNode).remove(Integer.parseInt(raw));
+            }
+            return ret;
+        }
+    }
+    @Override
+    public void serialize(JsonGenerator jgen, SerializerProvider provider) throws IOException {
+        jgen.writeStartObject();
+        jgen.writeStringField("op", this.op);
+        jgen.writeStringField("path", this.path.toString());
+        jgen.writeFieldName("original_value");
+        jgen.writeTree(this.value);
+        jgen.writeEndObject();
+    }
+    @Override
+    public void serializeWithType(JsonGenerator jgen, SerializerProvider provider, TypeSerializer typeSer) throws IOException {
+        this.serialize(jgen, provider);
+    }
+    @Override
+    public String toString() {
+        return "op: " + this.op + "; " + "path" + ": \"" + this.path + "\"; " + "value" + ": " + this.value;
+    }
+}
+
+//addOperation
+
+/*
+ * Copyright (c) 2014, Francis Galiegue (fgaliegue@gmail.com)
+ *
+ * This software is dual-licensed under:
+ *
+ * - the Lesser General Public License (LGPL) version 3.0 or, at your option, any
+ *   later version;
+ * - the Apache Software License (ASL) version 2.0.
+ *
+ * The text of this file and of both licenses is available at the root of this
+ * project or, if you have the jar distribution, in directory META-INF/, under
+ * the names LGPL-3.0.txt and ASL-2.0.txt respectively.
+ *
+ * Direct link to the sources:
+ *
+ * - LGPL 3.0: https://www.gnu.org/licenses/lgpl-3.0.txt
+ * - ASL 2.0: http://www.apache.org/licenses/LICENSE-2.0.txt
+ */
+
+package com.github.fge.jsonpatch;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.github.fge.jackson.jsonpointer.JsonPointer;
+import com.github.fge.jackson.jsonpointer.JsonPointerException;
+import com.github.fge.jackson.jsonpointer.ReferenceToken;
+import com.github.fge.jackson.jsonpointer.TokenResolver;
+
+import java.util.*;
+
+
+/**
+ * JSON Patch {@code add} operation
+ *
+ * <p>For this operation, {@code path} is the JSON Pointer where the value
+ * should be added, and {@code value} is the value to add.</p>
+ *
+ * <p>Note that if the target value pointed to by {@code path} already exists,
+ * it is replaced. In this case, {@code add} is equivalent to {@code replace}.
+ * </p>
+ *
+ * <p>Note also that a value will be created at the target path <b>if and only
+ * if</b> the immediate parent of that value exists (and is of the correct
+ * type).</p>
+ *
+ * <p>Finally, if the last reference token of the JSON Pointer is {@code -} and
+ * the immediate parent is an array, the given value is added at the end of the
+ * array. For instance, applying:</p>
+ *
+ * <pre>
+ *     { "op": "add", "path": "/-", "value": 3 }
+ * </pre>
+ *
+ * <p>to:</p>
+ *
+ * <pre>
+ *     [ 1, 2 ]
+ * </pre>
+ *
+ * <p>will give:</p>
+ *
+ * <pre>
+ *     [ 1, 2, 3 ]
+ * </pre>
+ */
+public final class AddOperation extends PathValueOperation {
+    private static final ReferenceToken LAST_ARRAY_ELEMENT = ReferenceToken.fromRaw("-");
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @JsonCreator
+    public AddOperation(@JsonProperty("path") final JsonPointer path, @JsonProperty("value") final JsonNode value) {
+        super("add", path, value);
+    }
+
+    @Override
+    public JsonNode apply(JsonNode node) throws JsonPatchException {
+        if (this.path.isEmpty()) {
+            return this.value;
+        }
+        /*
+         * Check the parent node: it must exist and be a container (i.e. an array
+         * or an object) for the add operation to work.
+         */
+        else {
+            JsonNode parentNode = this.path.parent().path(node);
+            //it will store that node value in which the operation is going to take place
+            //System.out.println("parentNode:= " + parentNode);
+            if (!parentNode.isMissingNode() && !parentNode.isNull()) {
+                if (!parentNode.isContainerNode() && !parentNode.isValueNode()) {
+                    throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.parentNotContainer"));
+                } else {
+                    return parentNode.isArray() ? this.addToArray(this.path, node) : this.addToObject(this.path, node);
+                }
+            } else {
+                //when parentNode is missing
+                try {
+                    JsonPointer preexistingPath = this.pathExistUpto(node, this.path);
+                    System.out.println("preExisting "+preexistingPath);
+                    JsonPointer missingPath = new JsonPointer(this.path.toString().replaceFirst(preexistingPath.toString(), ""));
+                    //it will store the missingPath which is not present
+                    //System.out.println("missingPath "+missingPath);
+                    JsonNode newValue = this.pathBuilder(missingPath, this.value);
+                    //it will then have the specified the missingPath which will specified by pathBuilder
+                    //System.out.println("JNewValue "+newValue);
+                    return preexistingPath.get(node).isArray() ? this.addToArray(node, preexistingPath, newValue) :
+                            this.addToObject(node, preexistingPath, newValue);
+                } catch (JsonPointerException var6) {
+                    throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.noSuchParent"));
+                }
+            }
+        }
+    }
+
+    private JsonNode addToArray(JsonNode node, JsonPointer newPath, JsonNode newValue) {
+        JsonNode ret = node.deepCopy();
+        ArrayNode target = (ArrayNode) newPath.get(ret);
+        target.add(newValue);
+        return ret;
+    }
+
+    private JsonNode addToArray(JsonPointer path, JsonNode node) {
+        JsonNode ret = node.deepCopy();
+        ArrayNode target = (ArrayNode) path.parent().get(ret);
+        //get the path and perform the operation in ret
+        ArrayList<JsonNode> existingValue = new ArrayList<>();
+        for (JsonNode traverse : target) {
+            if (!existingValue.contains(traverse)) {
+                //iterate and check whether the value in operation already present or not add that value which is not in
+                // existing here  existing don't null then it will add every value
+                existingValue.add(traverse);
+                // System.out.println("existingValue"+existingValue);
+            }
+        }
+        if (!existingValue.contains(this.value)) {
+            //then it will check whether the value is present or not if not then target will add that value to node
+            TokenResolver<JsonNode> token = Iterables.getLast(path);
+            if (token.getToken().equals(LAST_ARRAY_ELEMENT)) {
+                target.add(this.value);
+                return ret;
+            }
+        }
+        return ret;
+    }
+
+    private JsonNode addToObject(JsonPointer path, JsonNode node) {
+        final TokenResolver<JsonNode> token = Iterables.getLast(path);
+        final JsonNode ret = node.deepCopy();
+        //save node
+        final ObjectNode target = (ObjectNode) path.parent().get(ret);
+        //save the path and set the value and won't add any duplicates
+        target.set(token.getToken().getRaw(), value);
+        //System.out.println(target);
+        // System.out.println(ret);
+        return ret;
+    }
+
+    private JsonNode addToObject(JsonNode node, JsonPointer newPath, JsonNode newValue) throws JsonPatchException {
+        JsonNode ret = node.deepCopy();
+        JsonNode target;
+        if (newPath.isEmpty()) {
+            if (newValue.isArray()) {
+                throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.noSuchIndex"));
+            }
+        } else {
+            String lastOfPath = Iterables.getLast(newPath).getToken().getRaw();
+            //JsonNode target;
+            if (newPath.get(ret).isObject()) {
+                target = newPath.get(ret);
+            } else {
+                target = newPath.parent().get(ret);
+            }
+            if (lastOfPath.equals("-")) {
+                if (newValue.isArray()) {
+                    throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.noSuchIndex"));
+                }
+            } else if (lastOfPath.matches("[0-9]+")) {
+                if (!newValue.isObject()) {
+                    throw new JsonPatchException(BUNDLE.getMessage("jsonPatch.noSuchIndex"));
+                }
+                Iterator<String> fieldNames = newValue.fieldNames();
+                for (Iterator<String> it = fieldNames; it.hasNext(); ) {
+                    String fieldName = it.next();
+                    ((ObjectNode) target).set(fieldName, newValue.get(fieldName));
+                }
+            } else {
+                ((ObjectNode) target).set(lastOfPath, newValue);
+            }
+        }
+        return ret;
+    }
+
+    private JsonPointer pathExistUpto(JsonNode node, JsonPointer path) {
+        JsonPointer newPath = path;
+        //store the path
+        if (!path.isEmpty()) {
+            //traverse and search for path
+            JsonNode valueAtPath = path.path(node);
+            //find and locate the path
+            //System.out.println("valuePath "+valueAtPath);
+            if (valueAtPath.isMissingNode()) {
+                newPath = this.pathExistUpto(node, path.parent());
+            }
+        }
+        //System.out.println("newPath "+newPath);
+        return newPath;
+    }
+
+    private JsonNode pathBuilder(JsonPointer path, JsonNode value) {
+        if (!path.isEmpty()) {
+            //this will build the path which is missing
+            String lastOfPath = Iterables.getLast(path).getToken().getRaw();
+            //System.out.println("lastOfPath:= "+lastOfPath);
+            path = path.parent();
+            ArrayNode childArrayNode = this.objectMapper.createArrayNode();
+            ObjectNode childObjectNode = this.objectMapper.createObjectNode();
+            if (!lastOfPath.matches("[0-9]+") && !lastOfPath.equals("-")) {
+                childObjectNode.set(lastOfPath, value);
+                //it will set the value of missing path at the given value
+                value = this.pathBuilder(path, childObjectNode);
+            } else {
+                childArrayNode.add(value);
+                //it will add the path to the value
+                value = this.pathBuilder(path, childArrayNode);
+            }
+        }
+        return value;
+    }
+}

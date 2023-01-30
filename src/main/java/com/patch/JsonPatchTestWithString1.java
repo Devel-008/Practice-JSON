@@ -12,25 +12,6 @@ public class JsonPatchTestWithString1 {
 
         String s = """
                 {
-                 	"Account ID": "FRITESH",
-                 	"Roles": [
-                 		{
-                 			"ROLE": "ETL SUPPORT"
-                 		},
-                 		{
-                 			"ROLE": "Network Admin"
-                 		},
-                 		{
-                 			"ROLE": "CAG Developer",
-                 			"orBidNos": "r-22",
-                 			"value": "Albert"
-                 		},
-                 		{
-                 			"ROLE": "Cag Content Writter",
-                 			"orBidNos": "r-33",
-                 			"value": "Alex"
-                 		}
-                 	],
                  	"Groups": [
                  	],
                  	"Profiles": {
@@ -58,7 +39,18 @@ public class JsonPatchTestWithString1 {
                ]
                               
                """;
-       try {
+
+       /* String patch = """
+                [
+                \t{
+                \t\t"op": "add",
+                \t\t"path": "/Roles/0/a/0/b/-",
+                \t\t"value": {
+                \t\t\t"ROLE": "ETL SUPPORT"
+                \t\t}
+                \t}
+                ]""";*/
+        try {
            JsonPatch jsonPatch = JsonPatch.fromJson(mapper.readTree(patch));
            String target = String.valueOf(jsonPatch.apply(mapper.readTree(s)).toPrettyString());
            System.out.println(target);
